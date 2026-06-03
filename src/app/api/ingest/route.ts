@@ -114,9 +114,10 @@ export async function POST(req: NextRequest) {
       });
     });
 
-    // 7. Get Embeddings (using batching to handle 10k+ chunks efficiently)
+    // 7. Get Embeddings (using batching to handle 10k+ chunks efficiently and matching index dimensions)
     const textsToEmbed = chunksToEmbed.map(c => c.content);
-    const embeddings = await RAGService.getEmbeddingsBatch(textsToEmbed, apiKey);
+    const dim = await store.getDimension();
+    const embeddings = await RAGService.getEmbeddingsBatch(textsToEmbed, apiKey, dim);
 
     // 8. Map to VectorNodes
     const nodes: VectorNode[] = chunksToEmbed.map((item, idx) => {
