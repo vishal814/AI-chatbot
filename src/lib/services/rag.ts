@@ -14,6 +14,7 @@ export class RAGService {
   public static async getEmbeddingsBatch(
     texts: string[],
     apiKey: string,
+    dimension = 1536,
     batchSize = 100
   ): Promise<number[][]> {
     if (texts.length === 0) return [];
@@ -27,6 +28,7 @@ export class RAGService {
         const response = await openai.embeddings.create({
           model: 'text-embedding-3-small', // 1536-dimensional, highly cost-effective and accurate
           input: batch,
+          dimensions: dimension,
         });
 
         // Ensure order matches the input
@@ -57,6 +59,7 @@ export class RAGService {
     topK = 6
   ): Promise<RAGResponse> {
     const openai = new OpenAI({ apiKey });
+    const dim = await localStore.getDimension();
 
     // Step 1: Embed query
     let queryEmbedding: number[];
@@ -64,6 +67,7 @@ export class RAGService {
       const embedResp = await openai.embeddings.create({
         model: 'text-embedding-3-small',
         input: [query],
+        dimensions: dim,
       });
       queryEmbedding = embedResp.data[0].embedding;
     } catch (err) {
@@ -142,6 +146,7 @@ Rules:
     stream: AsyncIterable<any>;
   }> {
     const openai = new OpenAI({ apiKey });
+    const dim = await localStore.getDimension();
 
     // Step 1: Embed query
     let queryEmbedding: number[];
@@ -149,6 +154,7 @@ Rules:
       const embedResp = await openai.embeddings.create({
         model: 'text-embedding-3-small',
         input: [query],
+        dimensions: dim,
       });
       queryEmbedding = embedResp.data[0].embedding;
     } catch (err) {

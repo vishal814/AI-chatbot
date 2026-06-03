@@ -25,6 +25,7 @@ export class LocalVectorStore {
   private pc: Pinecone;
   private index: any;
   private indexName: string;
+  private cachedDimension: number | null = null;
 
   constructor() {
     const apiKey = process.env.PINECONE_API_KEY;
@@ -34,6 +35,25 @@ export class LocalVectorStore {
     this.indexName = process.env.PINECONE_INDEX || 'social-knowledge-base';
     this.pc = new Pinecone({ apiKey });
     this.index = this.pc.index(this.indexName);
+  }
+
+  /**
+   * Dynamically retrieves the index's dimension size to support whatever dimension (1536, 512, 384) 
+   * the user's Pinecone index is configured with.
+   */
+  public async getDimension(): Promise<number> {
+    if (this.cachedDimension !== null) {
+      return this.cachedDimension;
+    }
+    try {
+      const stats = await this.index.describeIndexStats();
+      const dim = stats.dimension || 1536;
+      this.cachedDimension = dim;
+      return dim;
+    } catch (e) {
+      console.warn('Failed to query Pinecone index stats for dimension, using default 1536:', e);
+      return 1536;
+    }
   }
 
   /**
@@ -103,7 +123,6 @@ export class LocalVectorStore {
   public async filterNewPosts(posts: any[]): Promise<any[]> {
     if (posts.length === 0) return [];
     
-    // Map each post to its first chunk ID: hash-0
     const chunkIdsToCheck = posts.map(post => {
       const postHash = LocalVectorStore.computeHash(post.content + post.platform + post.timestamp);
       return `${postHash}-0`;
@@ -135,22 +154,28 @@ export class LocalVectorStore {
   }
 
   /**
-   * Add a profile to Pinecone (stored as a special metadata document with a zero vector).
+   * Add a profile to Pinecone (stored as a special metadata document with a non-zero vector).
    */
   public async addProfile(platform: 'linkedin' | 'twitter' | 'instagram', profile: PlatformProfile): Promise<void> {
     try {
-      await this.index.upsert([{
-        id: `profile-${platform}`,
-        values: new Array(1536).fill(0), // Dummy 1536-dimensional vector for profile metadata storage
-        metadata: {
-          isProfile: true,
-          platform,
-          name: profile.name,
-          username: profile.username,
-          bio: profile.bio || '',
-          avatar: profile.avatar || '',
-        }
-      }]);
+      const dim = await this.getDimension();
+      const dummyVector = new Array(dim).fill(0);
+      dummyVector[0] = 1.0; // Dense vectors must contain at least one non-zero value in Pinecone Serverless
+
+      await this.index.upsert({
+        records: [{
+          id: `profile-${platform}`,
+          values: dummyVector,
+          metadata: {
+            isProfile: true,
+            platform,
+            name: profile.name,
+            username: profile.username,
+            bio: profile.bio || '',
+            avatar: profile.avatar || '',
+          }
+        }]
+      });
     } catch (err) {
       console.error('Failed to add profile to Pinecone:', err);
       throw new Error(`Pinecone profile update failed: ${(err as Error).message}`);
@@ -206,11 +231,11 @@ export class LocalVectorStore {
             hash: node.hash,
           }
         }));
-        await this.index.upsert(records);
+        await this.index.upsert({ records });
       }
     } catch (err) {
       console.error('Failed to upsert nodes to Pinecone:', err);
-      throw new Error(`Pinecone upsert failed: ${(err as Error).message}. Verify that the index exists and matches 1536 dimensions.`);
+      throw new Error(`Pinecone upsert failed: ${(err as Error).message}. Verify that the index exists and matches dimensions.`);
     }
   }
 
@@ -225,7 +250,6 @@ export class LocalVectorStore {
     }
   ): Promise<Array<{ node: Omit<VectorNode, 'embedding'>; similarity: number }>> {
     try {
-      // Build Pinecone query filter
       const queryFilter: any = { isProfile: { $ne: true } };
       if (filters?.platform) {
         queryFilter.platform = { $eq: filters.platform };
@@ -274,7 +298,6 @@ export class LocalVectorStore {
       const stats = await this.index.describeIndexStats();
       const totalRecords = stats.totalRecordCount || 0;
       
-      // Approximate chunks count by subtracting profile markers
       const totalChunks = Math.max(0, totalRecords - 3);
 
       return {
