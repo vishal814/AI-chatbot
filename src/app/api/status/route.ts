@@ -4,8 +4,8 @@ import { LocalVectorStore } from '@/lib/vectorStore';
 export async function GET(req: NextRequest) {
   try {
     const store = new LocalVectorStore();
-    const stats = store.stats();
-    const profiles = store.getProfiles();
+    const stats = await store.stats();
+    const profiles = await store.getProfiles();
 
     return NextResponse.json({
       stats,
@@ -20,10 +20,10 @@ export async function GET(req: NextRequest) {
 export async function DELETE(req: NextRequest) {
   try {
     const store = new LocalVectorStore();
-    store.clear();
+    await store.clear();
     return NextResponse.json({
       message: 'Vector database cleared successfully.',
-      stats: store.stats(),
+      stats: await store.stats(),
       profiles: {},
     });
   } catch (err) {

@@ -1,6 +1,5 @@
-import fs from 'fs';
-import path from 'path';
 import crypto from 'crypto';
+import { Pinecone } from '@pinecone-database/pinecone';
 
 export interface VectorNode {
   id: string;
@@ -11,7 +10,7 @@ export interface VectorNode {
   url?: string;
   media?: string[];
   author: string;
-  hash: string; // Hash of original content to prevent duplicate indexing
+  hash: string;
   embedding: number[];
 }
 
@@ -22,55 +21,19 @@ export interface PlatformProfile {
   avatar?: string;
 }
 
-export interface VectorStoreData {
-  nodes: VectorNode[];
-  processedHashes: string[]; // For O(1) deduplication checking
-  profiles: Record<string, PlatformProfile>;
-}
-
 export class LocalVectorStore {
-  private filePath: string;
-  private data: VectorStoreData;
+  private pc: Pinecone;
+  private index: any;
+  private indexName: string;
 
   constructor() {
-    // Save database file in the workspace directory under "data/vector_db.json"
-    this.filePath = path.join(process.cwd(), 'data', 'vector_db.json');
-    this.data = this.load();
-  }
-
-  /**
-   * Load the vector store database from disk.
-   */
-  private load(): VectorStoreData {
-    try {
-      if (fs.existsSync(this.filePath)) {
-        const fileContent = fs.readFileSync(this.filePath, 'utf-8');
-        return JSON.parse(fileContent);
-      }
-    } catch (err) {
-      console.error('Failed to load local vector store. Initializing new one.', err);
+    const apiKey = process.env.PINECONE_API_KEY;
+    if (!apiKey) {
+      throw new Error('PINECONE_API_KEY is not defined in environment variables. Please check your .env file.');
     }
-    return {
-      nodes: [],
-      processedHashes: [],
-      profiles: {},
-    };
-  }
-
-  /**
-   * Persist the database to disk.
-   */
-  private save(): void {
-    try {
-      const dir = path.dirname(this.filePath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-      fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), 'utf-8');
-    } catch (err) {
-      console.error('Failed to save vector store database to disk:', err);
-      throw new Error(`Disk write failed: ${(err as Error).message}`);
-    }
+    this.indexName = process.env.PINECONE_INDEX || 'social-knowledge-base';
+    this.pc = new Pinecone({ apiKey });
+    this.index = this.pc.index(this.indexName);
   }
 
   /**
@@ -81,16 +44,7 @@ export class LocalVectorStore {
   }
 
   /**
-   * Checks if content is already indexed.
-   */
-  public hasContent(hash: string): boolean {
-    return this.data.processedHashes.includes(hash);
-  }
-
-  /**
    * Smart-chunk a post into smaller semantic units.
-   * If the post is short, keep it as a single chunk.
-   * If the post is long, split it by paragraphs and sentences with sliding window overlaps.
    */
   public static chunkPost(content: string, maxChunkLen = 600, overlap = 100): string[] {
     const text = content.trim();
@@ -99,9 +53,7 @@ export class LocalVectorStore {
     }
 
     const chunks: string[] = [];
-    // Split by paragraph first
     const paragraphs = text.split(/\n\s*\n/);
-    
     let currentChunk = '';
     
     for (const paragraph of paragraphs) {
@@ -113,7 +65,6 @@ export class LocalVectorStore {
           currentChunk = paragraph;
         }
       } else {
-        // If a single paragraph is too long, split it by sentences
         if (currentChunk) {
           chunks.push(currentChunk);
           currentChunk = '';
@@ -126,7 +77,6 @@ export class LocalVectorStore {
             tempChunk += (tempChunk ? ' ' : '') + sentence;
           } else {
             if (tempChunk) chunks.push(tempChunk);
-            // Overlap: take a portion of the previous chunk if possible
             const overlapPart = tempChunk.slice(-overlap);
             const spaceIdx = overlapPart.indexOf(' ');
             const overlappingPrefix = spaceIdx !== -1 ? overlapPart.slice(spaceIdx + 1) : '';
@@ -147,151 +97,217 @@ export class LocalVectorStore {
   }
 
   /**
-   * Add a profile to the vector database.
+   * Batch checks which posts are new and filters out duplicates.
+   * Leverages Pinecone's batch fetch to check existance of chunk IDs (e.g. hash-0) in 1 network call.
    */
-  public addProfile(platform: 'linkedin' | 'twitter' | 'instagram', profile: PlatformProfile): void {
-    this.data.profiles[platform] = profile;
-    this.save();
+  public async filterNewPosts(posts: any[]): Promise<any[]> {
+    if (posts.length === 0) return [];
+    
+    // Map each post to its first chunk ID: hash-0
+    const chunkIdsToCheck = posts.map(post => {
+      const postHash = LocalVectorStore.computeHash(post.content + post.platform + post.timestamp);
+      return `${postHash}-0`;
+    });
+
+    const existingHashes = new Set<string>();
+    const batchSize = 1000;
+
+    try {
+      for (let i = 0; i < chunkIdsToCheck.length; i += batchSize) {
+        const batch = chunkIdsToCheck.slice(i, i + batchSize);
+        const fetchResult = await this.index.fetch(batch);
+        
+        if (fetchResult.records) {
+          Object.keys(fetchResult.records).forEach(id => {
+            const hash = id.split('-')[0];
+            existingHashes.add(hash);
+          });
+        }
+      }
+    } catch (err) {
+      console.warn('Pinecone fetch warning (index might be empty or uninitialized):', err);
+    }
+
+    return posts.filter(post => {
+      const postHash = LocalVectorStore.computeHash(post.content + post.platform + post.timestamp);
+      return !existingHashes.has(postHash);
+    });
+  }
+
+  /**
+   * Add a profile to Pinecone (stored as a special metadata document with a zero vector).
+   */
+  public async addProfile(platform: 'linkedin' | 'twitter' | 'instagram', profile: PlatformProfile): Promise<void> {
+    try {
+      await this.index.upsert([{
+        id: `profile-${platform}`,
+        values: new Array(1536).fill(0), // Dummy 1536-dimensional vector for profile metadata storage
+        metadata: {
+          isProfile: true,
+          platform,
+          name: profile.name,
+          username: profile.username,
+          bio: profile.bio || '',
+          avatar: profile.avatar || '',
+        }
+      }]);
+    } catch (err) {
+      console.error('Failed to add profile to Pinecone:', err);
+      throw new Error(`Pinecone profile update failed: ${(err as Error).message}`);
+    }
   }
 
   /**
    * Get all registered platform profiles.
    */
-  public getProfiles(): Record<string, PlatformProfile> {
-    return this.data.profiles;
+  public async getProfiles(): Promise<Record<string, PlatformProfile>> {
+    const profiles: Record<string, PlatformProfile> = {};
+    try {
+      const fetchResult = await this.index.fetch(['profile-linkedin', 'profile-twitter', 'profile-instagram']);
+      if (fetchResult.records) {
+        Object.entries(fetchResult.records).forEach(([_, record]: [string, any]) => {
+          const meta = record.metadata;
+          if (meta && meta.isProfile) {
+            profiles[meta.platform] = {
+              name: meta.name,
+              username: meta.username,
+              bio: meta.bio,
+              avatar: meta.avatar,
+            };
+          }
+        });
+      }
+    } catch (err) {
+      console.warn('Failed to retrieve profiles from Pinecone:', err);
+    }
+    return profiles;
   }
 
   /**
-   * Upsert vector nodes into the database.
+   * Upsert vector nodes into Pinecone.
    */
-  public upsertNodes(nodes: VectorNode[]): void {
-    nodes.forEach(node => {
-      // Avoid duplicate chunk IDs
-      const existingIdx = this.data.nodes.findIndex(n => n.id === node.id);
-      if (existingIdx !== -1) {
-        this.data.nodes[existingIdx] = node;
-      } else {
-        this.data.nodes.push(node);
+  public async upsertNodes(nodes: VectorNode[]): Promise<void> {
+    const batchSize = 100;
+    try {
+      for (let i = 0; i < nodes.length; i += batchSize) {
+        const batch = nodes.slice(i, i + batchSize);
+        const records = batch.map(node => ({
+          id: node.id,
+          values: node.embedding,
+          metadata: {
+            isProfile: false,
+            postId: node.postId,
+            platform: node.platform,
+            content: node.content,
+            timestamp: node.timestamp,
+            url: node.url || '',
+            media: node.media || [],
+            author: node.author,
+            hash: node.hash,
+          }
+        }));
+        await this.index.upsert(records);
       }
-
-      // Add to processed hashes
-      if (!this.data.processedHashes.includes(node.hash)) {
-        this.data.processedHashes.push(node.hash);
-      }
-    });
-
-    this.save();
+    } catch (err) {
+      console.error('Failed to upsert nodes to Pinecone:', err);
+      throw new Error(`Pinecone upsert failed: ${(err as Error).message}. Verify that the index exists and matches 1536 dimensions.`);
+    }
   }
 
   /**
-   * Search for similar nodes using cosine similarity.
+   * Search for similar nodes in Pinecone.
    */
-  public search(
+  public async search(
     queryEmbedding: number[],
     limit = 5,
     filters?: {
       platform?: 'linkedin' | 'twitter' | 'instagram';
-      dateRange?: { start?: string; end?: string };
     }
-  ): Array<{ node: Omit<VectorNode, 'embedding'>; similarity: number }> {
-    let candidates = this.data.nodes;
-
-    // Apply metadata filters
-    if (filters) {
-      if (filters.platform) {
-        candidates = candidates.filter(n => n.platform === filters.platform);
+  ): Promise<Array<{ node: Omit<VectorNode, 'embedding'>; similarity: number }>> {
+    try {
+      // Build Pinecone query filter
+      const queryFilter: any = { isProfile: { $ne: true } };
+      if (filters?.platform) {
+        queryFilter.platform = { $eq: filters.platform };
       }
-      if (filters.dateRange) {
-        const { start, end } = filters.dateRange;
-        if (start) {
-          const startTime = new Date(start).getTime();
-          candidates = candidates.filter(n => new Date(n.timestamp).getTime() >= startTime);
-        }
-        if (end) {
-          const endTime = new Date(end).getTime();
-          candidates = candidates.filter(n => new Date(n.timestamp).getTime() <= endTime);
-        }
-      }
+
+      const queryResponse = await this.index.query({
+        vector: queryEmbedding,
+        topK: limit,
+        includeMetadata: true,
+        filter: queryFilter,
+      });
+
+      const matches = queryResponse.matches || [];
+      return matches.map((match: any) => {
+        const meta = match.metadata;
+        return {
+          node: {
+            id: match.id,
+            postId: meta.postId || '',
+            platform: meta.platform,
+            content: meta.content || '',
+            timestamp: meta.timestamp || '',
+            url: meta.url || undefined,
+            media: meta.media || undefined,
+            author: meta.author || '',
+            hash: meta.hash || '',
+          },
+          similarity: match.score || 0,
+        };
+      });
+    } catch (err) {
+      console.error('Pinecone search error:', err);
+      throw new Error(`Pinecone query failed: ${(err as Error).message}. Make sure your index name is correct and active.`);
     }
-
-    // Compute similarity scores
-    const scored = candidates.map(node => {
-      const similarity = LocalVectorStore.cosineSimilarity(queryEmbedding, node.embedding);
-      // Remove embedding from search results to save payload transfer size
-      const { embedding, ...nodeWithoutEmbedding } = node;
-      return {
-        node: nodeWithoutEmbedding,
-        similarity,
-      };
-    });
-
-    // Sort descending and return top K
-    return scored
-      .sort((a, b) => b.similarity - a.similarity)
-      .slice(0, limit);
-  }
-
-  /**
-   * Computes the cosine similarity of two vectors.
-   */
-  public static cosineSimilarity(a: number[], b: number[]): number {
-    if (a.length !== b.length) return 0;
-    
-    let dotProduct = 0;
-    let normA = 0;
-    let normB = 0;
-    
-    for (let i = 0; i < a.length; i++) {
-      dotProduct += a[i] * b[i];
-      normA += a[i] * a[i];
-      normB += b[i] * b[i];
-    }
-    
-    if (normA === 0 || normB === 0) return 0;
-    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
   }
 
   /**
    * Get database statistics.
    */
-  public stats(): {
+  public async stats(): Promise<{
     totalChunks: number;
     totalUniquePosts: number;
     platformStats: Record<string, { chunks: number; posts: number }>;
-  } {
-    const stats: Record<string, { chunks: number; posts: Set<string> }> = {
-      linkedin: { chunks: 0, posts: new Set() },
-      twitter: { chunks: 0, posts: new Set() },
-      instagram: { chunks: 0, posts: new Set() },
-    };
+  }> {
+    try {
+      const stats = await this.index.describeIndexStats();
+      const totalRecords = stats.totalRecordCount || 0;
+      
+      // Approximate chunks count by subtracting profile markers
+      const totalChunks = Math.max(0, totalRecords - 3);
 
-    this.data.nodes.forEach(n => {
-      if (stats[n.platform]) {
-        stats[n.platform].chunks++;
-        stats[n.platform].posts.add(n.postId);
-      }
-    });
-
-    return {
-      totalChunks: this.data.nodes.length,
-      totalUniquePosts: this.data.processedHashes.length,
-      platformStats: {
-        linkedin: { chunks: stats.linkedin.chunks, posts: stats.linkedin.posts.size },
-        twitter: { chunks: stats.twitter.chunks, posts: stats.twitter.posts.size },
-        instagram: { chunks: stats.instagram.chunks, posts: stats.instagram.posts.size },
-      },
-    };
+      return {
+        totalChunks,
+        totalUniquePosts: totalChunks,
+        platformStats: {
+          linkedin: { chunks: 0, posts: 0 },
+          twitter: { chunks: 0, posts: 0 },
+          instagram: { chunks: 0, posts: 0 },
+        }
+      };
+    } catch (e) {
+      return {
+        totalChunks: 0,
+        totalUniquePosts: 0,
+        platformStats: {
+          linkedin: { chunks: 0, posts: 0 },
+          twitter: { chunks: 0, posts: 0 },
+          instagram: { chunks: 0, posts: 0 },
+        }
+      };
+    }
   }
 
   /**
-   * Clear the entire database.
+   * Clear the entire Pinecone database.
    */
-  public clear(): void {
-    this.data = {
-      nodes: [],
-      processedHashes: [],
-      profiles: {},
-    };
-    this.save();
+  public async clear(): Promise<void> {
+    try {
+      await this.index.deleteAll();
+    } catch (err) {
+      console.error('Failed to wipe Pinecone index:', err);
+      throw new Error(`Pinecone wipe failed: ${(err as Error).message}`);
+    }
   }
 }

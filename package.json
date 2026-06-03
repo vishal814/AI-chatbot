@@ -11,6 +11,7 @@
     "make-mocks": "npx tsx src/create_mock_zip.ts"
   },
   "dependencies": {
+    "@pinecone-database/pinecone": "^7.2.0",
     "jszip": "^3.10.1",
     "next": "14.2.3",
     "openai": "^6.41.0",

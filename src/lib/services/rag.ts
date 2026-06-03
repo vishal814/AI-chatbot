@@ -71,7 +71,7 @@ export class RAGService {
     }
 
     // Step 2: Retrieve relevant chunks
-    const results = localStore.search(queryEmbedding, topK);
+    const results = await localStore.search(queryEmbedding, topK);
 
     if (results.length === 0) {
       return {
@@ -156,7 +156,7 @@ Rules:
     }
 
     // Step 2: Retrieve relevant chunks
-    const results = localStore.search(queryEmbedding, topK);
+    const results = await localStore.search(queryEmbedding, topK);
 
     // Step 3: Format context
     const contextStr = results
